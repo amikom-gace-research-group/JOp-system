@@ -5,8 +5,9 @@ import numpy as np
 import pandas as pd
 from board import IBoard, Jetson
 import configs
-from configs import EPISLON, MIN_EPSILON, RUNTIME_GUARD, PMODE_ID,\
-                    LOGGING_LEVEL, MODELS, ALPHAS, CONSTRAINTS, SPEC_ORDER
+from configs import EPISLON, MIN_EPSILON, RUNTIME_GUARD, CPU_DENVER_0, CPU_DENVER_1,\
+                    CPU_DENVER_2, GPU_FREQ, CPU_ONLINE, EMC_FREQ, LOGGING_LEVEL, MODELS,\
+                    ALPHAS, CONSTRAINTS, SPEC_ORDER
 logging.basicConfig(format='%(asctime)s %(levelname)s:%(message)s', datefmt='%I:%M:%S %p', stream=sys.stdout, level=LOGGING_LEVEL)
 
 ALPHA, POWER_BUDGET, THROUGHPUT_TARGET, SCORE_THRESHOLD = 0, 0, 0, 0
@@ -16,20 +17,24 @@ print("Using Q-Learning Algorithm")
 class Agent():
     def __init__(self, board: IBoard):
         self.round_num = 0
-        self.epsilon = [EPISLON for _ in range(len(PMODE_ID))]
         self.client = board
-        pmode_list = [i for i in range(len(PMODE_ID))]
-        self.states = np.array(np.meshgrid(pmode_list, board.CONCURRENCY, indexing='ij')).T.reshape(-1,2)
+        self.epsilon = [EPISLON for _ in range(len(self.client.CONCURRENCY))]
+        self.states = np.array(np.meshgrid(self.client.CONCURRENCY, CPU_DENVER_0, CPU_DENVER_1, CPU_DENVER_2, CPU_ONLINE, GPU_FREQ, EMC_FREQ, indexing='ij')).T.reshape(-1,7)
         self.RL = QTable(self.client, self.states, Action)
-        self.cl_index = 0
+        self.client.cl = 1
+        self.cpu_freq1_index = len(CPU_DENVER_0)-1
+        self.cpu_freq2_index = len(CPU_DENVER_1)-1
+        self.cpu_freq3_index = len(CPU_DENVER_2)-1
+        self.cpu_core_index = len(CPU_ONLINE)-1
+        self.gpu_freq_index = len(GPU_FREQ)-1
+        self.mem_freq_index = len(EMC_FREQ)-1
         self.current_state = np.array([])
         self.measured_data = {}
-        self.last_cl = {}
-        self.best_cl = {}
-        self.oracle_data = np.array([{} for i in range(len(PMODE_ID))])
-        self.num_of_violations_training = np.array([0 for i in range(len(PMODE_ID))])
+        self.last_sets = {}
+        self.best_sets = {}
+        self.oracle_data = np.array([{} for i in range(len(self.client.CONCURRENCY))])
+        self.num_of_violations_training = np.array([0 for i in range(len(self.client.CONCURRENCY))])
         self.num_of_violations_evaluations = 0
-        self.client.power_mode = list(PMODE_ID.keys())[-1]
         self.evaluation = False
         self.toggled = False
         self.eval_data = {'throughput': [], 'power': [], 'score':[]}
@@ -40,28 +45,33 @@ class Agent():
         self.measured_data = {}
     
     def get_current_state(self):
-        self.pmode_index = self.get_current_pmode_index()
-        current_state = np.array([self.pmode_index, self.get_cl_setting()])
+        self.cl_index = self.get_current_cl_index()
+        current_state = np.array([self.cl_index, *self.get_sets()])
         return current_state
 
     def get_current_state_index(self):
-        pmode_index = self.get_current_pmode_index()
-        return [pmode_index, self.cl_index]
+        cl_index = self.get_current_cl_index()
+        return [cl_index, self.cpu_core_index, self.cpu_freq1_index, self.cpu_freq2_index, self.cpu_freq3_index, self.gpu_freq_index, self.mem_freq_index]
     
-    def get_cl_setting(self):
-        cl = self.client.CONCURRENCY[self.cl_index]
-        return np.array(cl)
+    def get_sets(self):
+        cpu_cores = CPU_ONLINE[self.cpu_core_index]
+        cpu_freq1 = CPU_DENVER_0[self.cpu_freq1_index]
+        cpu_freq2 = CPU_DENVER_1[self.cpu_freq2_index]
+        cpu_freq3 = CPU_DENVER_2[self.cpu_freq3_index]
+        gpu_freq = GPU_FREQ[self.gpu_freq_index]
+        mem_freq = EMC_FREQ[self.mem_freq_index]
+        return np.array([cpu_cores, cpu_freq1, cpu_freq2, cpu_freq3, gpu_freq, mem_freq])
     
-    def get_current_pmode_index(self):
-        pmode = self.client.get_power_mode()
-        return [idx for idx, key in enumerate(list(PMODE_ID.items())) if key[0] == pmode][0]
+    def get_current_cl_index(self):
+        cl = self.client.get_cl()
+        return [idx for idx, key in enumerate(self.client.CONCURRENCY) if key == cl][0]
     
-    def get_best_oracle_data(self, powermode):
-        pmode_index = [idx for idx, key in enumerate(list(PMODE_ID.items())) if key[0] == powermode][0]
+    def get_best_oracle_data(self, cl):
+        cl_index = [idx for idx, key in enumerate(self.client.CONCURRENCY) if key == cl][0]
         data = []
-        for pmode in self.oracle_data[pmode_index].keys():
-            measured = self.oracle_data[pmode_index][pmode]
-            measured['pmode'] = pmode
+        for sets in self.oracle_data[cl_index].keys():
+            measured = self.oracle_data[cl_index][sets]
+            measured['settings'] = sets
             if ALPHA == 0 and measured['throughput'] > THROUGHPUT_TARGET:
                 data.append(measured)
             elif ALPHA == 1 and measured['power'] < POWER_BUDGET:
@@ -77,33 +87,59 @@ class Agent():
         else:
             return data
     
-    def special_cl_adjustment(self):
-        self.cl_index = 0
+    def special_freq_adjustment(self):
+        self.cpu_freq1_index = len(CPU_DENVER_0)-1
+        self.cpu_freq2_index = len(CPU_DENVER_1)-1
+        self.cpu_freq3_index = len(CPU_DENVER_2)-1
+        self.cpu_core_index = len(CPU_ONLINE)-1
+        self.gpu_freq_index = len(GPU_FREQ)-1
+        self.mem_freq_index = len(EMC_FREQ)-1
 
     def set_client_settings(self, action):
-        cl_size = len(self.client.CONCURRENCY)
-
-        if action == Action.INC_CL:
-            self.cl_index = min(self.cl_index + 1, cl_size - 1)
-        elif action == Action.DEC_CL:
-            self.cl_index = max(0, self.cl_index - 1)
-        elif action == Action.DO_NOTHING:
-            pass
-        elif action == None:
-            self.special_cl_adjustment()
-        self.client.set_cl_settings(self.get_cl_setting())
+        actions_list = list(Action)[action.value].name.split('_')
+        
+        if "INC_CPU_CORE" in actions_list:
+            self.cpu_core_index = min(self.cpu_core_index + 1, len(CPU_ONLINE) - 1)
+        if "DEC_CPU_CORE" in actions_list:
+            self.cpu_core_index = max(0, self.cpu_core_index - 1)
+        if "INC_CPU_FREQ1" in actions_list:
+            self.cpu_freq1_index = min(self.cpu_freq1_index + 1, len(CPU_DENVER_0) - 1)
+        if "DEC_CPU_FREQ1" in actions_list:
+            self.cpu_freq1_index = max(0, self.cpu_freq1_index - 1)
+        if "INC_CPU_FREQ2" in actions_list:
+            self.cpu_freq2_index = min(self.cpu_freq2_index + 1, len(CPU_DENVER_1) - 1)
+        if "DEC_CPU_FREQ2" in actions_list:
+            self.cpu_freq2_index = max(0, self.cpu_freq2_index - 1)
+        if "INC_CPU_FREQ3" in actions_list:
+            self.cpu_freq3_index = min(self.cpu_freq3_index + 1, len(CPU_DENVER_2) - 1)
+        if "DEC_CPU_FREQ3" in actions_list:
+            self.cpu_freq3_index = max(0, self.cpu_freq3_index - 1)
+        if "INC_GPU_FREQ" in actions_list:
+            self.gpu_freq_index = min(self.gpu_freq_index + 1, len(GPU_FREQ) - 1)
+        if "DEC_GPU_FREQ" in actions_list:
+            self.gpu_freq_index = max(0, self.gpu_freq_index - 1)
+        if "INC_MEM_FREQ" in actions_list:
+            self.mem_freq_index = min(self.mem_freq_index + 1, len(EMC_FREQ) - 1)
+        if "DEC_MEM_FREQ" in actions_list:
+            self.mem_freq_index = max(0, self.mem_freq_index - 1)
+        if action == None:
+            self.special_freq_adjustment()
+        self.set_settings(self.get_sets())
     
     def run_inference_and_collect_data(self):
         new_state = str(self.get_current_state())
         if new_state in self.measured_data.keys() and not self.evaluation:
             return self.measured_data[new_state]
+        prev_t = time()
         measured = self.client.run_inference()
+        end_t = time() - prev_t
+        logging.info(f"OD Inference Time: {round(end_t, 2)} sec")
         if measured:
             if self.calculate_reward(measured) < 0:
-                self.num_of_violations_training[self.get_current_pmode_index()] += 1
-            if not new_state in self.oracle_data[self.get_current_pmode_index()].keys() \
-                or self.oracle_data[self.get_current_pmode_index()][str(self.get_cl_setting())]['throughput'] < measured['throughput']:
-                self.oracle_data[self.get_current_pmode_index()][str(self.get_cl_setting())] = measured
+                self.num_of_violations_training[self.get_current_cl_index()] += 1
+            if not new_state in self.oracle_data[self.get_current_cl_index()].keys() \
+                or self.oracle_data[self.get_current_cl_index()][str(self.get_sets())]['throughput'] < measured['throughput']:
+                self.oracle_data[self.get_current_cl_index()][str(self.get_sets())] = measured
             self.measured_data[new_state] = measured
             return measured
     
@@ -119,27 +155,16 @@ class Agent():
         else:
             reward = -1
 
-        self.last_cl[self.client.power_mode] = [str(self.get_cl_setting()), self.cl_index]
-        if not self.client.power_mode in self.best_cl or reward > self.best_cl[self.client.power_mode][0]:
-            self.best_cl[self.client.power_mode] = [reward, self.cl_index, str(self.get_cl_setting())]
+        self.last_sets[self.client.cl] = [str(self.get_sets()), [self.cpu_core_index, self.cpu_freq1_index, self.cpu_freq2_index, self.cpu_freq3_index, self.gpu_freq_index, self.mem_freq_index]]
+        if not self.client.cl in self.best_sets or reward > self.best_sets[self.client.cl][0]:
+            self.best_sets[self.client.cl] = [reward, [self.cpu_core_index, self.cpu_freq1_index, self.cpu_freq2_index, self.cpu_freq3_index, self.gpu_freq_index, self.mem_freq_index]]
         return reward
     
-    def set_power_mode(self):
-        if not self.evaluation:
-            for index, pmode in enumerate(list(PMODE_ID.keys())[1:]):
-                if self.round_num > (configs.TOTAL_EPSIODES * (index+1)) // len(PMODE_ID):
-                    self.client.power_mode = pmode
-            if self.round_num < (configs.TOTAL_EPSIODES) // len(PMODE_ID):
-                self.client.power_mode = list(PMODE_ID.keys())[0]
-        if not str(self.get_current_state) in self.measured_data.keys():
-            self.set_client_settings(Action.DO_NOTHING)
-            self.run_inference_and_collect_data()
-    
-    def capture_data(self, reward, measured_metrics, cl_setting):
-        self.reward_history.append({cl_setting:reward})
+    def capture_data(self, reward, measured_metrics, sets):
+        self.reward_history.append({sets:reward})
         if reward < 0:
-            for pmode_index in range(self.get_current_pmode_index(), len(PMODE_ID)):
-                self.RL.prohibited_states[pmode_index][str(self.get_cl_setting())] = True
+            for cl_index in range(self.get_current_cl_index(), len(self.client.CONCURRENCY)):
+                self.RL.prohibited_states[cl_index][str(self.get_sets())] = True
         if self.evaluation == True:
             self.eval_data['throughput'].append(measured_metrics['throughput'])
             self.eval_data['power'].append(measured_metrics['power'])
@@ -155,39 +180,43 @@ class Agent():
         logging.info("agent started learning optimization")
 
         while self.round_num < configs.TOTAL_EPSIODES:
-            logging.debug(f"round number: {self.round_num}, epsilon: {self.epsilon}")
-            self.round_num += 1
-            
-            self.current_state = self.get_current_state()
-            self.set_power_mode()
-            logging.debug(f"current state: {self.current_state}")
-            
-            choosen_action = self.RL.get_action(self.current_state, self.epsilon[self.pmode_index], self.get_current_state_index())
-            logging.debug(f"new choosen action: {str(choosen_action)}")
-            
-            self.set_client_settings(choosen_action)
-            logging.debug(f"new cl setting: {self.get_cl_setting()}")
+            for cl in range(len(self.client.CONCURRENCY)):
+                self.cl_index = cl
+                self.client.set_settings(self.get_sets())
+                logging.debug(f"round number: {self.round_num}, epsilon: {self.epsilon}")
+                self.round_num += 1
+                
+                self.current_state = self.get_current_state()
+                
+                choosen_action = self.RL.get_action(self.current_state, self.epsilon[self.cl_index], self.get_current_state_index())
+                logging.debug(f"new choosen action: {str(choosen_action)}")
+                
+                self.set_client_settings(choosen_action)
+                if str(self.get_current_state()) in self.measured_data.keys():
+                    logging.info("Trained")
+                    break
+                logging.debug(f"new sets setting: {self.get_sets()}")
 
-            measured_metrics = self.run_inference_and_collect_data()
-            if choosen_action == None or measured_metrics == None:
-                continue
-            logging.debug(f"throughput: {measured_metrics['throughput']} - power: {measured_metrics['power']} - score: {measured_metrics['score']}")
-            
-            reward = self.calculate_reward(measured_metrics)
-            logging.debug(f"reward: {reward}")
-            
-            new_state = np.array([self.current_state[0], self.get_cl_setting()])
-            new_state_value = self.RL.update_qlearning(self.current_state, choosen_action, new_state, reward)
-            logging.debug(f"new state value: {new_state_value}")
-            self.current_state = new_state
-            
-            self.capture_data(reward, measured_metrics, str(self.get_cl_setting()))
+                measured_metrics = self.run_inference_and_collect_data()
+                if choosen_action == None or measured_metrics == None:
+                    continue
+                logging.debug(f"throughput: {measured_metrics['throughput']} - power: {measured_metrics['power']} - score: {measured_metrics['score']}")
+                
+                reward = self.calculate_reward(measured_metrics)
+                logging.debug(f"reward: {reward}")
+                
+                new_state = np.array([self.current_state[0], self.get_sets()])
+                new_state_value = self.RL.update_qlearning(self.current_state, choosen_action, new_state, reward)
+                logging.debug(f"new state value: {new_state_value}")
+                self.current_state = new_state
+                
+                self.capture_data(reward, measured_metrics, str(self.get_sets()))
 
-            self.epsilon[self.pmode_index] = max(self.epsilon[self.pmode_index] * EPISLON, MIN_EPSILON)
-            
+                self.epsilon[self.cl_index] = max(self.epsilon[self.cl_index] * EPISLON, MIN_EPSILON)
+                
         self.stop_time = time()
         elapsed = round(self.stop_time - self.start_time, 2)
-        logging.info(f"agent finished learning optimization after {self.round_num} steps, {elapsed}s")
+        logging.info(f"agent finished measurement and learning optimization after {self.round_num} steps, {elapsed}s")
         # q_table_visualizer = QTableVisualizer(self.RL.table)
         # q_table_visualizer.visualize()
         return elapsed
@@ -195,6 +224,7 @@ class Agent():
 def main():
     global ALPHA, POWER_BUDGET, THROUGHPUT_TARGET, SCORE_THRESHOLD
 
+    prev_train = time()
     result = []
     oracle_res = []
     rewards = []
@@ -208,35 +238,40 @@ def main():
                 ALPHA = alpha
                 
                 print(model["name"], ALPHA, const, POWER_BUDGET, THROUGHPUT_TARGET, SCORE_THRESHOLD)
-                
-                board_client = Jetson()
+               
+                board_client = Jetson(True)
+
+                if SCORE_THRESHOLD > board_client.client.file_score[configs.MODEL_NAME]:
+                    print(f"Score does not meet Score Threshold")
+                    continue
+
                 agent = Agent(board_client)
                 elapsed = agent.train()
 
                 qos = "power" if ALPHA==1 else (("throughput_target" if ALPHA==0 else "score_threshold") if ALPHA else "default")
                 rewards.append({"data": agent.reward_history, "xlabel": f"{configs.MODEL_NAME.title()} QoS: {const}-{qos}", "Time Elapsed": elapsed})    
                 
-                for eval_pmode in PMODE_ID.keys():
+                for cl in self.client.CONCURRENCY:
                     agent.round_num = 0
                     agent.evaluation = True
-                    agent.epsilon = [MIN_EPSILON for _ in range(len(PMODE_ID))]
+                    agent.epsilon = [MIN_EPSILON for _ in range(len(self.client.CONCURRENCY))]
                     agent.num_of_violations_evaluations = 0
-                    agent.client.power_mode = eval_pmode
-                    configs.TOTAL_EPSIODES = 500
-                    if eval_pmode in agent.best_cl.keys():
-                        agent.cl_index = agent.best_cl[eval_pmode][1]
+                    agent.client.cl = cl
+                    configs.TOTAL_EPSIODES = 5
+                    if cl in agent.best_sets.keys():
+                        agent.cl_index = agent.best_sets[cl][1]
                         agent.train()
 
-                for pi, pmode in enumerate(PMODE_ID.keys()):
-                    if pmode in agent.last_cl.keys():
-                        if agent.round_num == configs.TOTAL_EPSIODES and not (agent.RL.prohibited_states[pi][agent.last_cl[pmode][0]] if agent.last_cl[pmode][0] in agent.RL.prohibited_states[pi].keys() else False):
-                            row_low = agent.client.client.run_inference(agent.last_cl[pmode][0], pmode)
-                            result.append({"model": model["name"], "pmode": pmode, "power_budget": POWER_BUDGET, "throughput_target": THROUGHPUT_TARGET, "score_threshold": SCORE_THRESHOLD, "alpha": ALPHA, "constraint_level": const,
-                                "CL": str(agent.last_cl[pmode][0]), "throughput": row_low["throughput"], "power": row_low["power"], "score" :row_low["score"], "violations": agent.num_of_violations_evaluations})
-                            oracle_data = agent.get_best_oracle_data(pmode)
+                for clid, cl in enumerate(self.client.CONCURRENCY):
+                    if cl in agent.last_sets.keys():
+                        if agent.round_num == configs.TOTAL_EPSIODES and not (agent.RL.prohibited_states[clid][agent.last_sets[cl][0]] if agent.last_sets[cl][0] in agent.RL.prohibited_states[clid].keys() else False):
+                            row_low = agent.client.client.run_inference(agent.last_sets[cl][0], cl)
+                            result.append({"model": model["name"], "cl": cl, "power_budget": POWER_BUDGET, "throughput_target": THROUGHPUT_TARGET, "score_threshold": SCORE_THRESHOLD, "alpha": ALPHA, "constraint_level": const,
+                                "settings": str(agent.last_sets[cl][0]), "throughput": row_low["throughput"], "power": row_low["power"], "score" :row_low["score"], "violations": agent.num_of_violations_evaluations})
+                            oracle_data = agent.get_best_oracle_data(cl)
                             if oracle_data:
-                                oracle_res.append({"model": model["name"], "pmode": pmode, "power_budget": POWER_BUDGET, "throughput_target": THROUGHPUT_TARGET, "score_threshold": SCORE_THRESHOLD, "alpha": ALPHA, "constraint_level": const,
-                                "CL": oracle_data['pmode'], "throughput": oracle_data["throughput"], "power": oracle_data["power"], "score" :oracle_data["score"],})
+                                oracle_res.append({"model": model["name"], "cl": cl, "power_budget": POWER_BUDGET, "throughput_target": THROUGHPUT_TARGET, "score_threshold": SCORE_THRESHOLD, "alpha": ALPHA, "constraint_level": const,
+                                "setting": oracle_data['settings'], "throughput": oracle_data["throughput"], "power": oracle_data["power"], "score" :oracle_data["score"],})
 
                             with open('results/result_qlearning.csv', 'w', newline='') as output_file:
                                 dict_writer = csv.DictWriter(output_file, result[0].keys())
@@ -250,6 +285,9 @@ def main():
                                     if output_file.tell() == 0:  # Check if the file is empty
                                         dict_writer.writeheader()  # Write the header only if the file is empty
                                     dict_writer.writerows(oracle_res)
+    
+    end_train = time() - prev_train
+    print("Total Time Elapsed for Training RL", round(end_train, 2), "sec")
 
     df_reward = pd.DataFrame(rewards)
     df_reward.to_csv("results/rewards_qlearning.csv", index=False)

@@ -1,11 +1,30 @@
 import numpy as np
-
+import itertools
 from enum import Enum
-from configs import MU, GAMMA, PMODE_ID
+from configs import MU, GAMMA, CPU_DENVER_0, CPU_DENVER_1, CPU_DENVER_2, GPU_FREQ, EMC_FREQ, CPU_ONLINE
+
 from board import IBoard
 
-class Action(Enum):
-    INC_CL, DEC_CL, DO_NOTHING = range(3)
+# Define all possible individual actions
+cpu_core_actions = ["INC_CPU_CORE", "DEC_CPU_CORE", "DO_NOTHING_CPU_CORE"]
+cpu_freq1_actions = ["INC_CPU_FREQ1", "DEC_CPU_FREQ1", "DO_NOTHING_CPU_FREQ1"]
+cpu_freq2_actions = ["INC_CPU_FREQ2", "DEC_CPU_FREQ2", "DO_NOTHING_CPU_FREQ2"]
+cpu_freq3_actions = ["INC_CPU_FREQ3", "DEC_CPU_FREQ3", "DO_NOTHING_CPU_FREQ3"]
+gpu_freq_actions = ["INC_GPU_FREQ", "DEC_GPU_FREQ", "DO_NOTHING_GPU_FREQ"]
+mem_freq_actions = ["INC_MEM_FREQ", "DEC_MEM_FREQ", "DO_NOTHING_MEM_FREQ"]
+
+# Generate all combinations of these actions
+all_combinations = list(itertools.product(cpu_core_actions, cpu_freq1_actions, cpu_freq2_actions,
+                                          cpu_freq3_actions, gpu_freq_actions, mem_freq_actions))
+
+# Remove duplicates (if any)
+unique_combinations = list(set(all_combinations))
+print("Unique Combinations", len(unique_combinations))
+
+action_dict = {"_".join(combo): i for i, combo in enumerate(unique_combinations)}
+
+# Dynamically create the Enum class with the given actions
+Action = Enum('Action', action_dict)
 
 class QTable():
     def __init__(self, client: IBoard, states, actions):
@@ -24,21 +43,45 @@ class QTable():
     
     def init_prohibited_states(self):
         self.prohibited_states = []
-        for _ in range(len(PMODE_ID)):
+        for _ in range(len(self.client.CONCURRENCY)):
             self.prohibited_states.append({})
     
     def get_next_state(self, current_state_index, action):
-        cl_index = np.array(current_state_index[1:])
-        cl_size = len(self.client.CONCURRENCY)
+        next_state_index = current_state_index[1:]
+        err = 0
+        
+        # Map each component of the action to the appropriate state update
+        actions_list = list(Action)[action.value].name.split('_')
+        
+        if "INC_CPU_CORE" in actions_list:
+            next_state_index[0] = min(next_state_index[0] + 1, len(CPU_ONLINE) - 1)
+        if "DEC_CPU_CORE" in actions_list:
+            next_state_index[0] = max(0, next_state_index[0] - 1)
+        if "INC_CPU_FREQ1" in actions_list:
+            next_state_index[1] = min(next_state_index[1] + 1, len(CPU_DENVER_0) - 1)
+        if "DEC_CPU_FREQ1" in actions_list:
+            next_state_index[1] = max(0, next_state_index[1] - 1)
+        if "INC_CPU_FREQ2" in actions_list:
+            next_state_index[2] = min(next_state_index[2] + 1, len(CPU_DENVER_1) - 1)
+        if "DEC_CPU_FREQ2" in actions_list:
+            next_state_index[2] = max(0, next_state_index[2] - 1)
+        if "INC_CPU_FREQ3" in actions_list:
+            next_state_index[3] = min(next_state_index[3] + 1, len(CPU_DENVER_2) - 1)
+        if "DEC_CPU_FREQ3" in actions_list:
+            next_state_index[3] = max(0, next_state_index[3] - 1)
+        if "INC_GPU_FREQ" in actions_list:
+            next_state_index[4] = min(next_state_index[4] + 1, len(GPU_FREQ) - 1)
+        if "DEC_GPU_FREQ" in actions_list:
+            next_state_index[4] = max(0, next_state_index[4] - 1)
+        if "INC_MEM_FREQ" in actions_list:
+            next_state_index[5] = min(next_state_index[5] + 1, len(EMC_FREQ) - 1)
+        if "DEC_MEM_FREQ" in actions_list:
+            next_state_index[5] = max(0, next_state_index[5] - 1)
 
-        if action == Action.INC_CL:
-            cl_index = min(cl_index + 1, cl_size - 1)
-        elif action == Action.DEC_CL:
-            cl_index = max(0, cl_index - 1)
-        elif action == Action.DO_NOTHING:
-            pass
-        next_state_index = [current_state_index[0], cl_index]
-        err = 1 if action != Action.DO_NOTHING and next_state_index == current_state_index else 0
+        # Check for invalid actions that don't change the state
+        if next_state_index == current_state_index:
+            err = 1
+        
         return next_state_index, err
     
     def available_actions(self, current_state_index: np.array):
@@ -60,7 +103,7 @@ class QTable():
                 action = np.random.choice(available_actions)
             else:
                 action = self.get_largest_q_action(str(current_state))
-                return Action(action)
+            return Action(action)
     
     def get_largest_q_action(self, state):
         return np.argmax(self.table[state])
@@ -101,5 +144,5 @@ class QTableVisualizer:
             print(f"State: {state}")
             print("Actions:")
             for action, q_value in enumerate(actions):
-                print(f"  Action {action}: Q-value = {q_value}")
+                print(f"  Action {Action(action).name}: Q-value = {q_value}")
             print()
